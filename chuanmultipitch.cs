@@ -27,6 +27,12 @@ class ChuanMultiPitch
         "    a17        = sox pitch per voice,        volume = values (needs sox)\n" +
         "    rubberband = ffmpeg rubberband per voice, volume = values (needs ffmpeg)\n" +
         "\n" +
+        "[6] OPTIONAL FLAG (--type default|audiobuggy|reverse|oppositepitch, default = default)\n" +
+        "    default       = plain pitch shift\n" +
+        "    audiobuggy    = swap halves: [2nd half][1st half]\n" +
+        "    reverse       = play the audio backwards\n" +
+        "    oppositepitch = flip pitch signs, --pitch -7;6 -> 7;-6\n" +
+        "\n" +
         "volume per pitch: default = (values / 2) + 0.5, a17/rubberband = values\n" +
         "pitch shifts WITHOUT speed change\n" +
         "\n" +
@@ -41,6 +47,7 @@ class ChuanMultiPitch
         bool nlogs = false;
         List<string> rest = new List<string>();
         string pitchtype = "default";
+        string type = "default";
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -60,12 +67,24 @@ class ChuanMultiPitch
                 if (i + 1 < args.Length) pitchtype = args[++i];
                 continue;
             }
+            if (a == "--type")
+            {
+                if (i + 1 < args.Length) type = args[++i];
+                continue;
+            }
             rest.Add(a);
         }
 
         if (pitchtype != "default" && pitchtype != "a17" && pitchtype != "rubberband")
         {
             Fail(nlogs, "ERROR: Invalid pitchtype.");
+            return 1;
+        }
+
+        if (type != "default" && type != "audiobuggy" &&
+            type != "reverse" && type != "oppositepitch")
+        {
+            Fail(nlogs, "ERROR: Invalid type.");
             return 1;
         }
 
@@ -104,6 +123,12 @@ class ChuanMultiPitch
             return 1;
         }
 
+        if (type == "oppositepitch")
+        {
+            for (int i = 0; i < pitches.Count; i++)
+                pitches[i] = -pitches[i];
+        }
+
         byte[] file;
         try
         {
@@ -128,6 +153,19 @@ class ChuanMultiPitch
         double[] pcm = DecodePcm(file, info, frames);
         double[] mix = new double[total];
 
+        if (type == "reverse")
+        {
+            ReversePcm(pcm, frames, info.Channels);
+        }
+        else if (type == "audiobuggy")
+        {
+            long nf;
+            pcm = AudioBuggyPcm(pcm, frames, info.Channels, out nf);
+            frames = nf;
+            total = frames * info.Channels;
+            mix = new double[total];
+        }
+
         double inRms = 0.0;
         for (long i = 0; i < total; i++)
             inRms += pcm[i] * pcm[i];
@@ -148,6 +186,12 @@ class ChuanMultiPitch
         }
         else
         {
+            string inTmp = "chuanmp." + Process.GetCurrentProcess().Id + ".in.wav";
+            if (!WriteWav(inTmp, info.Channels, info.SampleRate, pcm, frames))
+            {
+                Fail(nlogs, "ERROR: Cannot write temp file.");
+                return 1;
+            }
             for (int i = 0; i < pitches.Count && ok; i++)
             {
                 string tmp = "chuanmp." + Process.GetCurrentProcess().Id + "." + i + ".wav";
@@ -155,12 +199,12 @@ class ChuanMultiPitch
                 if (pitchtype == "a17")
                 {
                     long cents = (long)Math.Round(pitches[i] * 100.0);
-                    cmd = "sox -q \"" + input + "\" \"" + tmp + "\" pitch " + cents.ToString() + " 10 10 10";
+                    cmd = "sox -q \"" + inTmp + "\" \"" + tmp + "\" pitch " + cents.ToString() + " 10 10 10";
                 }
                 else
                 {
                     double ratio = Math.Pow(2.0, pitches[i] / 12.0);
-                    cmd = "ffmpeg -hide_banner -loglevel error -y -i \"" + input +
+                    cmd = "ffmpeg -hide_banner -loglevel error -y -i \"" + inTmp +
                           "\" -af \"rubberband=pitch=" + ratio.ToString("F6", CultureInfo.InvariantCulture) +
                           ":window=long:transients=crisp:smoothing=2.14748e+09/4.9:" +
                           "pitchq=speed:detector=percussive\" \"" + tmp + "\"";
@@ -176,6 +220,7 @@ class ChuanMultiPitch
                 for (long j = 0; j < lim * info.Channels; j++)
                     mix[j] += tp[j];
             }
+            File.Delete(inTmp);
         }
         if (!ok)
         {
@@ -256,6 +301,45 @@ class ChuanMultiPitch
         if (!ParseWav(file, out info)) { frames = 0; return null; }
         frames = info.DataSize / (info.Bits / 8) / info.Channels;
         return DecodePcm(file, info, frames);
+    }
+
+    // ------------------------------------------------------------------
+    // --type transforms
+    // ------------------------------------------------------------------
+
+    static void ReversePcm(double[] pcm, long frames, int channels)
+    {
+        for (long i = 0; i < frames / 2; i++)
+        {
+            long a = i * channels;
+            long b = (frames - 1 - i) * channels;
+            for (int c = 0; c < channels; c++)
+            {
+                double t = pcm[a + c];
+                pcm[a + c] = pcm[b + c];
+                pcm[b + c] = t;
+            }
+        }
+    }
+
+    // audiobuggy: {1} = trim start by half duration (keep 2nd half),
+    // {2} = trim end by half duration (keep 1st half), concat {1,2}
+    static double[] AudioBuggyPcm(double[] pcm, long frames, int channels, out long outFrames)
+    {
+        long half = frames / 2;
+        if (half < 1) half = 1;
+        long on = half * 2;
+        double[] outp = new double[on * channels];
+        for (long f = 0; f < half; f++)
+        {
+            for (int c = 0; c < channels; c++)
+            {
+                outp[f * channels + c] = pcm[(f + half) * channels + c];
+                outp[(f + half) * channels + c] = pcm[f * channels + c];
+            }
+        }
+        outFrames = on;
+        return outp;
     }
 
     // ------------------------------------------------------------------
