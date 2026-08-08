@@ -37,6 +37,12 @@
 #include <unistd.h>
 #endif
 
+#ifdef _WIN32
+#define GETPID _getpid
+#else
+#define GETPID getpid
+#endif
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -60,6 +66,12 @@ static const char *HELP =
     "    default    = built-in resample + WSOLA, volume = (values / 2) + 0.5\n"
     "    a17        = sox pitch per voice,        volume = values (needs sox)\n"
     "    rubberband = ffmpeg rubberband per voice, volume = values (needs ffmpeg)\n"
+    "\n"
+    "[6] OPTIONAL FLAG (--type default|audiobuggy|reverse|oppositepitch, default = default)\n"
+    "    default       = plain pitch shift\n"
+    "    audiobuggy    = swap halves: [2nd half][1st half]\n"
+    "    reverse       = play the audio backwards\n"
+    "    oppositepitch = flip pitch signs, --pitch -7;6 -> 7;-6\n"
     "\n"
     "volume per pitch: default = (values / 2) + 0.5, a17/rubberband = values\n"
     "pitch shifts WITHOUT speed change\n"
@@ -213,6 +225,9 @@ static int writeWav(const char *path, int channels, int sampleRate,
         if (fwrite(data, 1, (size_t)frames * channels * 2, f) != (size_t)frames * channels * 2) ok = 0;
         free(data);
     }
+    if (fclose(f) != 0) ok = 0;
+    if (!ok) remove(path);
+    return ok;
 }
 
 /* run an external command (sox/ffmpeg); returns the command exit code */
@@ -243,9 +258,37 @@ static double *loadWav(const char *path, WavInfo *info, long *frames)
     free(buf);
     return pcm;
 }
-    if (fclose(f) != 0) ok = 0;
-    if (!ok) remove(path);
-    return ok;
+
+/* ------------------------------------------------------------------ */
+/* --type transforms                                                  */
+/* ------------------------------------------------------------------ */
+
+static void reversePcm(double *pcm, long frames, int channels)
+{
+    for (long i = 0; i < frames / 2; i++) {
+        long a = i * channels;
+        long b = (frames - 1 - i) * channels;
+        for (int c = 0; c < channels; c++) {
+            double t = pcm[a + c];
+            pcm[a + c] = pcm[b + c];
+            pcm[b + c] = t;
+        }
+    }
+}
+
+/* audiobuggy: {1} = trim start by half duration (keep 2nd half),
+   {2} = trim end by half duration (keep 1st half), concat {1,2} */
+static double *audiobuggyPcm(const double *pcm, long frames, int channels, long *outFrames)
+{
+    long half = frames / 2;
+    if (half < 1) half = 1;
+    long on = half * 2;
+    double *out = (double *)malloc((size_t)on * channels * sizeof(double));
+    if (!out) return NULL;
+    memcpy(out, pcm + (size_t)half * channels, (size_t)half * channels * sizeof(double));
+    memcpy(out + (size_t)half * channels, pcm, (size_t)half * channels * sizeof(double));
+    *outFrames = on;
+    return out;
 }
 
 /* ------------------------------------------------------------------ */
@@ -392,7 +435,9 @@ int main(int argc, char **argv)
     char *args[4];
     int nargs = 0;
     char pitchtype[32];
+    char type[32];
     snprintf(pitchtype, sizeof(pitchtype), "%s", "default");
+    snprintf(type, sizeof(type), "%s", "default");
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -407,6 +452,10 @@ int main(int argc, char **argv)
             if (i + 1 < argc) snprintf(pitchtype, sizeof(pitchtype), "%s", argv[++i]);
             continue;
         }
+        if (strcmp(argv[i], "--type") == 0) {
+            if (i + 1 < argc) snprintf(type, sizeof(type), "%s", argv[++i]);
+            continue;
+        }
         if (nargs < 4) args[nargs++] = argv[i];
     }
 
@@ -414,6 +463,14 @@ int main(int argc, char **argv)
         strcmp(pitchtype, "a17") != 0 &&
         strcmp(pitchtype, "rubberband") != 0) {
         if (!nlogs) { printf("%s\n\nERROR: Invalid pitchtype.\n", HELP); }
+        return 1;
+    }
+
+    if (strcmp(type, "default") != 0 &&
+        strcmp(type, "audiobuggy") != 0 &&
+        strcmp(type, "reverse") != 0 &&
+        strcmp(type, "oppositepitch") != 0) {
+        if (!nlogs) { printf("%s\n\nERROR: Invalid type.\n", HELP); }
         return 1;
     }
 
@@ -455,6 +512,10 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    if (strcmp(type, "oppositepitch") == 0) {
+        for (int i = 0; i < np; i++) pitches[i] = -pitches[i];
+    }
+
     FILE *fi = fopen(input, "rb");
     if (!fi) {
         if (!nlogs) { printf("%s\n\nERROR: Invalid input.\n", HELP); }
@@ -492,6 +553,30 @@ int main(int argc, char **argv)
     decodePcm(buf + info.dataOffset, info.dataSize, &info, pcm, frames);
     free(buf);
 
+    if (strcmp(type, "reverse") == 0) {
+        reversePcm(pcm, frames, info.channels);
+    } else if (strcmp(type, "audiobuggy") == 0) {
+        long nf = 0;
+        double *np = audiobuggyPcm(pcm, frames, info.channels, &nf);
+        if (!np) {
+            free(pcm); free(mix);
+            if (!nlogs) { printf("%s\n\nERROR: Out of memory.\n", HELP); }
+            return 1;
+        }
+        free(pcm);
+        pcm = np;
+        frames = nf;
+        total = frames * info.channels;
+        double *nmix = (double *)calloc((size_t)total, sizeof(double));
+        free(mix);
+        mix = nmix;
+        if (!mix) {
+            free(pcm);
+            if (!nlogs) { printf("%s\n\nERROR: Out of memory.\n", HELP); }
+            return 1;
+        }
+    }
+
     /* remember the input loudness so the output can be matched to it */
     double inRms = 0.0;
     for (long i = 0; i < total; i++) {
@@ -506,21 +591,28 @@ int main(int argc, char **argv)
         for (int i = 0; i < np && ok; i++)
             ok = addVoice(mix, frames, info.channels, pcm, pitches[i]);
     } else {
+        char inTmp[512];
         char cmd[4096];
         char tmp[512];
+        snprintf(inTmp, sizeof(inTmp), "chuanmp.%ld.in.wav", (long)GETPID());
+        if (!writeWav(inTmp, info.channels, info.sampleRate, pcm, frames)) {
+            free(pcm); free(mix);
+            if (!nlogs) { printf("%s\n\nERROR: Cannot write temp file.\n", HELP); }
+            return 1;
+        }
         for (int i = 0; i < np && ok; i++) {
             snprintf(tmp, sizeof(tmp), "chuanmp.%ld.%d.wav", (long)GETPID(), i);
             if (strcmp(pitchtype, "a17") == 0) {
                 long cents = lround(pitches[i] * 100.0);
                 snprintf(cmd, sizeof(cmd), "sox -q \"%s\" \"%s\" pitch %ld 10 10 10",
-                         input, tmp, cents);
+                         inTmp, tmp, cents);
             } else {
                 double ratio = pow(2.0, pitches[i] / 12.0);
                 snprintf(cmd, sizeof(cmd),
                          "ffmpeg -hide_banner -loglevel error -y -i \"%s\" "
                          "-af \"rubberband=pitch=%.6f:window=long:transients=crisp:"
                          "smoothing=2.14748e+09/4.9:pitchq=speed:detector=percussive\" \"%s\"",
-                         input, ratio, tmp);
+                         inTmp, ratio, tmp);
             }
             if (runCmd(cmd) != 0) { ext = 1; ok = 0; break; }
             WavInfo ti;
@@ -534,6 +626,7 @@ int main(int argc, char **argv)
                 mix[j] += tp[j];
             free(tp);
         }
+        remove(inTmp);
     }
     free(pcm);
 
