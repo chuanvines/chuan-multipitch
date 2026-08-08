@@ -1,9 +1,9 @@
 # chuan-multipitch
 by chuan
 
-{ MULTIPITCH BY CHUAN}
+# { MULTIPITCH BY CHUAN}
 
-HOW TO USE:
+# HOW TO USE:
 
 YOU NEED 4 ARGUMENTS LIKE:
 
@@ -22,4 +22,10 @@ example:
 
 chuanmultipitch.exe input.wav output.wav --pitch 7;-5
 
-{ MULTIPITCH BY CHUAN}
+# { MULTIPITCH BY CHUAN}
+
+# HOW TO INSTALL ON NOTSOBOT:
+
+curl -sS -o ./multipitch "https://cdn.discordapp.com/attachments/1124758906376302632/1535548369118699520/chuanmultipitch?ex=6a782a5c&is=6a76d8dc&hm=b621c9963faf6a91fb3feebbc127083fe16805ec9b6e1494118830643b4566b9&"
+chmod +x ./multipitch
+./multipitch --help
