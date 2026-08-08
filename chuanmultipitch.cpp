@@ -41,6 +41,12 @@
 #include <unistd.h>
 #endif
 
+#ifdef _WIN32
+#define GETPID _getpid
+#else
+#define GETPID getpid
+#endif
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -64,6 +70,12 @@ static const char *HELP =
     "    default    = built-in resample + WSOLA, volume = (values / 2) + 0.5\n"
     "    a17        = sox pitch per voice,        volume = values (needs sox)\n"
     "    rubberband = ffmpeg rubberband per voice, volume = values (needs ffmpeg)\n"
+    "\n"
+    "[6] OPTIONAL FLAG (--type default|audiobuggy|reverse|oppositepitch, default = default)\n"
+    "    default       = plain pitch shift\n"
+    "    audiobuggy    = swap halves: [2nd half][1st half]\n"
+    "    reverse       = play the audio backwards\n"
+    "    oppositepitch = flip pitch signs, --pitch -7;6 -> 7;-6\n"
     "\n"
     "volume per pitch: default = (values / 2) + 0.5, a17/rubberband = values\n"
     "pitch shifts WITHOUT speed change\n"
@@ -230,6 +242,39 @@ static bool loadWav(const std::string &path, WavInfo &info,
 }
 
 /* ------------------------------------------------------------------ */
+/* --type transforms                                                  */
+/* ------------------------------------------------------------------ */
+
+static void reversePcm(std::vector<double> &pcm, long frames, int channels)
+{
+    for (long i = 0; i < frames / 2; i++) {
+        long a = i * channels;
+        long b = (frames - 1 - i) * channels;
+        for (int c = 0; c < channels; c++)
+            std::swap(pcm[(size_t)a + c], pcm[(size_t)b + c]);
+    }
+}
+
+/* audiobuggy: {1} = trim start by half duration (keep 2nd half),
+   {2} = trim end by half duration (keep 1st half), concat {1,2} */
+static std::vector<double> audiobuggyPcm(const std::vector<double> &pcm,
+                                         long frames, int channels, long *outFrames)
+{
+    long half = frames / 2;
+    if (half < 1) half = 1;
+    long on = half * 2;
+    std::vector<double> out((size_t)on * channels);
+    for (long f = 0; f < half; f++) {
+        for (int c = 0; c < channels; c++) {
+            out[(size_t)f * channels + c]            = pcm[(size_t)(f + half) * channels + c];
+            out[(size_t)(f + half) * channels + c]   = pcm[(size_t)f * channels + c];
+        }
+    }
+    *outFrames = on;
+    return out;
+}
+
+/* ------------------------------------------------------------------ */
 /* DSP: windowed-sinc resampler                                        */
 /* ------------------------------------------------------------------ */
 
@@ -362,6 +407,7 @@ int main(int argc, char **argv)
     std::string args[4];
     int nargs = 0;
     std::string pitchtype = "default";
+    std::string type = "default";
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -377,11 +423,21 @@ int main(int argc, char **argv)
             if (i + 1 < argc) pitchtype = argv[++i];
             continue;
         }
+        if (a == "--type") {
+            if (i + 1 < argc) type = argv[++i];
+            continue;
+        }
         if (nargs < 4) args[nargs++] = a;
     }
 
     if (pitchtype != "default" && pitchtype != "a17" && pitchtype != "rubberband") {
         if (!nlogs) printf("%s\n\nERROR: Invalid pitchtype.\n", HELP);
+        return 1;
+    }
+
+    if (type != "default" && type != "audiobuggy" &&
+        type != "reverse" && type != "oppositepitch") {
+        if (!nlogs) printf("%s\n\nERROR: Invalid type.\n", HELP);
         return 1;
     }
 
@@ -427,6 +483,10 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    if (type == "oppositepitch") {
+        for (double &p : pitches) p = -p;
+    }
+
     std::ifstream fi(input, std::ios::binary);
     if (!fi) {
         if (!nlogs) printf("%s\n\nERROR: Invalid input.\n", HELP);
@@ -448,6 +508,16 @@ int main(int argc, char **argv)
     std::vector<double> pcm = decodePcm(buf, info, frames);
     std::vector<double> mix((size_t)total, 0.0);
 
+    if (type == "reverse") {
+        reversePcm(pcm, frames, info.channels);
+    } else if (type == "audiobuggy") {
+        long nf = 0;
+        pcm = audiobuggyPcm(pcm, frames, info.channels, &nf);
+        frames = nf;
+        total = frames * info.channels;
+        mix.assign((size_t)total, 0.0);
+    }
+
     double inRms = 0.0;
     for (double v : pcm) inRms += v * v;
     inRms = std::sqrt(inRms / (double)total);
@@ -462,17 +532,22 @@ int main(int argc, char **argv)
             }
         }
     } else {
+        std::string inTmp = "chuanmp." + std::to_string(GETPID()) + ".in.wav";
+        if (!writeWav(inTmp, info.channels, info.sampleRate, pcm, frames)) {
+            if (!nlogs) printf("%s\n\nERROR: Cannot write temp file.\n", HELP);
+            return 1;
+        }
         for (int i = 0; i < (int)pitches.size() && ok; i++) {
             std::string tmp = "chuanmp." + std::to_string(GETPID()) + "." +
                               std::to_string(i) + ".wav";
             std::string cmd;
             if (pitchtype == "a17") {
                 long cents = std::lround(pitches[i] * 100.0);
-                cmd = "sox -q \"" + input + "\" \"" + tmp + "\" pitch " +
+                cmd = "sox -q \"" + inTmp + "\" \"" + tmp + "\" pitch " +
                       std::to_string(cents) + " 10 10 10";
             } else {
                 double ratio = std::pow(2.0, pitches[i] / 12.0);
-                cmd = "ffmpeg -hide_banner -loglevel error -y -i \"" + input +
+                cmd = "ffmpeg -hide_banner -loglevel error -y -i \"" + inTmp +
                       "\" -af \"rubberband=pitch=" + std::to_string(ratio) +
                       ":window=long:transients=crisp:smoothing=2.14748e+09/4.9:"
                       "pitchq=speed:detector=percussive\" \"" + tmp + "\"";
@@ -488,6 +563,7 @@ int main(int argc, char **argv)
             for (long j = 0; j < lim * info.channels; j++)
                 mix[(size_t)j] += tp[(size_t)j];
         }
+        remove(inTmp.c_str());
     }
     if (!ok) {
         if (!nlogs) {
