@@ -67,9 +67,8 @@ static const char *HELP =
     "    a17        = sox pitch per voice,        volume = values (needs sox)\n"
     "    rubberband = ffmpeg rubberband per voice, volume = values (needs ffmpeg)\n"
     "\n"
-    "[6] OPTIONAL FLAG (--type default|audiobuggy|reverse|oppositepitch, default = default)\n"
+    "[6] OPTIONAL FLAG (--type default|reverse|oppositepitch, default = default)\n"
     "    default       = plain pitch shift\n"
-    "    audiobuggy    = swap halves: [2nd half][1st half]\n"
     "    reverse       = play the audio backwards\n"
     "    oppositepitch = flip pitch signs, --pitch -7;6 -> 7;-6\n"
     "\n"
@@ -276,21 +275,6 @@ static void reversePcm(double *pcm, long frames, int channels)
     }
 }
 
-/* audiobuggy: {1} = trim start by half duration (keep 2nd half),
-   {2} = trim end by half duration (keep 1st half), concat {1,2} */
-static double *audiobuggyPcm(const double *pcm, long frames, int channels, long *outFrames)
-{
-    long half = frames / 2;
-    if (half < 1) half = 1;
-    long on = half * 2;
-    double *out = (double *)malloc((size_t)on * channels * sizeof(double));
-    if (!out) return NULL;
-    memcpy(out, pcm + (size_t)half * channels, (size_t)half * channels * sizeof(double));
-    memcpy(out + (size_t)half * channels, pcm, (size_t)half * channels * sizeof(double));
-    *outFrames = on;
-    return out;
-}
-
 /* ------------------------------------------------------------------ */
 /* DSP: windowed-sinc resampler                                        */
 /* ------------------------------------------------------------------ */
@@ -467,7 +451,6 @@ int main(int argc, char **argv)
     }
 
     if (strcmp(type, "default") != 0 &&
-        strcmp(type, "audiobuggy") != 0 &&
         strcmp(type, "reverse") != 0 &&
         strcmp(type, "oppositepitch") != 0) {
         if (!nlogs) { printf("%s\n\nERROR: Invalid type.\n", HELP); }
@@ -555,26 +538,6 @@ int main(int argc, char **argv)
 
     if (strcmp(type, "reverse") == 0) {
         reversePcm(pcm, frames, info.channels);
-    } else if (strcmp(type, "audiobuggy") == 0) {
-        long nf = 0;
-        double *np = audiobuggyPcm(pcm, frames, info.channels, &nf);
-        if (!np) {
-            free(pcm); free(mix);
-            if (!nlogs) { printf("%s\n\nERROR: Out of memory.\n", HELP); }
-            return 1;
-        }
-        free(pcm);
-        pcm = np;
-        frames = nf;
-        total = frames * info.channels;
-        double *nmix = (double *)calloc((size_t)total, sizeof(double));
-        free(mix);
-        mix = nmix;
-        if (!mix) {
-            free(pcm);
-            if (!nlogs) { printf("%s\n\nERROR: Out of memory.\n", HELP); }
-            return 1;
-        }
     }
 
     /* remember the input loudness so the output can be matched to it */
