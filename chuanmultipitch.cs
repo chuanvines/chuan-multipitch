@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Text;
@@ -21,7 +22,12 @@ class ChuanMultiPitch
         "\n" +
         "[4] VALUE (semitones -120..120, decimals ok, example: --pitch 7.5;-2.5)\n" +
         "\n" +
-        "volume per pitch = (values / 2) + 0.5 (--pitch 7;-5 = volume 1.5, --pitch 7;5;5 = volume 2)\n" +
+        "[5] OPTIONAL FLAG (--pitchtype default|a17|rubberband, default = default)\n" +
+        "    default    = built-in resample + WSOLA, volume = (values / 2) + 0.5\n" +
+        "    a17        = sox pitch per voice,        volume = values (needs sox)\n" +
+        "    rubberband = ffmpeg rubberband per voice, volume = values (needs ffmpeg)\n" +
+        "\n" +
+        "volume per pitch: default = (values / 2) + 0.5, a17/rubberband = values\n" +
         "pitch shifts WITHOUT speed change\n" +
         "\n" +
         "example:\n" +
@@ -34,9 +40,11 @@ class ChuanMultiPitch
     {
         bool nlogs = false;
         List<string> rest = new List<string>();
+        string pitchtype = "default";
 
-        foreach (string a in args)
+        for (int i = 0; i < args.Length; i++)
         {
+            string a = args[i];
             if (a == "--help" || a == "-h")
             {
                 Console.WriteLine(HelpText);
@@ -47,7 +55,18 @@ class ChuanMultiPitch
                 nlogs = true;
                 continue;
             }
+            if (a == "--pitchtype")
+            {
+                if (i + 1 < args.Length) pitchtype = args[++i];
+                continue;
+            }
             rest.Add(a);
+        }
+
+        if (pitchtype != "default" && pitchtype != "a17" && pitchtype != "rubberband")
+        {
+            Fail(nlogs, "ERROR: Invalid pitchtype.");
+            return 1;
         }
 
         if (rest.Count < 4)
@@ -115,30 +134,68 @@ class ChuanMultiPitch
         inRms = Math.Sqrt(inRms / (double)total);
 
         bool ok = true;
-        foreach (double p in pitches)
+        bool ext = false;
+        if (pitchtype == "default")
         {
-            if (!AddVoice(mix, frames, info.Channels, pcm, p))
+            foreach (double p in pitches)
             {
-                ok = false;
-                break;
+                if (!AddVoice(mix, frames, info.Channels, pcm, p))
+                {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        else
+        {
+            for (int i = 0; i < pitches.Count && ok; i++)
+            {
+                string tmp = "chuanmp." + Process.GetCurrentProcess().Id + "." + i + ".wav";
+                string cmd;
+                if (pitchtype == "a17")
+                {
+                    long cents = (long)Math.Round(pitches[i] * 100.0);
+                    cmd = "sox \"" + input + "\" \"" + tmp + "\" pitch " + cents.ToString();
+                }
+                else
+                {
+                    double ratio = Math.Pow(2.0, pitches[i] / 12.0);
+                    cmd = "ffmpeg -hide_banner -loglevel error -y -i \"" + input +
+                          "\" -af \"rubberband=pitch=" + ratio.ToString("F6", CultureInfo.InvariantCulture) +
+                          ":window=long:transients=crisp:smoothing=2.14748e+09/4.9:" +
+                          "pitchq=speed:detector=percussive\" \"" + tmp + "\"";
+                }
+                if (!Run(cmd)) { ext = true; ok = false; break; }
+                WavInfo ti;
+                long tf;
+                double[] tp = LoadWav(tmp, out ti, out tf);
+                File.Delete(tmp);
+                if (tp == null) { ext = true; ok = false; break; }
+                if (ti.Channels != info.Channels) { ext = true; ok = false; break; }
+                long lim = tf < frames ? tf : frames;
+                for (long j = 0; j < lim * info.Channels; j++)
+                    mix[j] += tp[j];
             }
         }
         if (!ok)
         {
-            Fail(nlogs, "ERROR: Out of memory.");
+            if (ext) Fail(nlogs, "ERROR: External pitch tool (sox/ffmpeg) failed.");
+            else Fail(nlogs, "ERROR: Out of memory.");
             return 1;
         }
 
-        // volume per pitch = (values / 2) + 0.5: scale the mix so its loudness is
-        // (n / 2 + 0.5) x the input (--pitch 7;-5 = volume 1.5, --pitch 7;5;5 = volume 2);
-        // a soft limiter catches the louder peaks so it never harshly clips
+        // volume per pitch: default = (values / 2) + 0.5, a17/rubberband = values;
+        // scale the mix so its loudness is that many x the input; a soft limiter
+        // catches the louder peaks so it never harshly clips
+        double vol = (pitchtype == "default")
+                     ? ((double)pitches.Count / 2.0 + 0.5) : (double)pitches.Count;
         double rms = 0.0;
         for (long i = 0; i < total; i++)
             rms += mix[i] * mix[i];
         rms = Math.Sqrt(rms / (double)total);
         if (inRms > 0.0 && rms > 0.0)
         {
-            double g = (inRms * ((double)pitches.Count / 2.0 + 0.5)) / rms;
+            double g = (inRms * vol) / rms;
             const double T = 0.95; // soft-limiter threshold
             for (long i = 0; i < total; i++)
             {
@@ -172,6 +229,33 @@ class ChuanMultiPitch
         Console.WriteLine(HelpText);
         Console.WriteLine();
         Console.WriteLine(msg);
+    }
+
+    // run an external command (sox/ffmpeg); true on success
+    static bool Run(string cmd)
+    {
+        try
+        {
+            Process p = Process.Start(new ProcessStartInfo("cmd.exe", "/c " + cmd)
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true
+            });
+            p.WaitForExit();
+            return p.ExitCode == 0;
+        }
+        catch { return false; }
+    }
+
+    // load a WAV file into a double buffer (used for external-tool temp files)
+    static double[] LoadWav(string path, out WavInfo info, out long frames)
+    {
+        byte[] file;
+        try { file = File.ReadAllBytes(path); }
+        catch { info = null; frames = 0; return null; }
+        if (!ParseWav(file, out info)) { frames = 0; return null; }
+        frames = info.DataSize / (info.Bits / 8) / info.Channels;
+        return DecodePcm(file, info, frames);
     }
 
     // ------------------------------------------------------------------
