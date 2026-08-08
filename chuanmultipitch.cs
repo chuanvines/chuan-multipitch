@@ -155,7 +155,7 @@ class ChuanMultiPitch
                 if (pitchtype == "a17")
                 {
                     long cents = (long)Math.Round(pitches[i] * 100.0);
-                    cmd = "sox \"" + input + "\" \"" + tmp + "\" pitch " + cents.ToString();
+                    cmd = "sox -q \"" + input + "\" \"" + tmp + "\" pitch " + cents.ToString() + " 10 10 10";
                 }
                 else
                 {
