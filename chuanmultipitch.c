@@ -12,6 +12,11 @@
  *   so "--pitch 7;-5" = 2 voices at volume 1.5, "--pitch 7;5;5" = 3 voices at volume 2.
  *   Peaks are soft-limited so the louder mix never harshly clips.
  *
+ *   Optional --pitchtype <default|a17|rubberband> (default = "default"):
+ *     default    = built-in resample + WSOLA, no external tools, volume = (values / 2) + 0.5
+ *     a17        = sox "pitch" per voice,  volume = values (requires sox)
+ *     rubberband = ffmpeg rubberband filter per voice, volume = values (requires ffmpeg)
+ *
  *   Pitch is shifted WITHOUT changing speed/duration
  *   (windowed-sinc resample + WSOLA time-stretch).
  *
@@ -25,6 +30,12 @@
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
+
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -45,7 +56,12 @@ static const char *HELP =
     "\n"
     "[4] VALUE (semitones -120..120, decimals ok, example: --pitch 7.5;-2.5)\n"
     "\n"
-    "volume per pitch = (values / 2) + 0.5 (--pitch 7;-5 = volume 1.5, --pitch 7;5;5 = volume 2)\n"
+    "[5] OPTIONAL FLAG (--pitchtype default|a17|rubberband, default = default)\n"
+    "    default    = built-in resample + WSOLA, volume = (values / 2) + 0.5\n"
+    "    a17        = sox pitch per voice,        volume = values (needs sox)\n"
+    "    rubberband = ffmpeg rubberband per voice, volume = values (needs ffmpeg)\n"
+    "\n"
+    "volume per pitch: default = (values / 2) + 0.5, a17/rubberband = values\n"
     "pitch shifts WITHOUT speed change\n"
     "\n"
     "example:\n"
@@ -197,6 +213,36 @@ static int writeWav(const char *path, int channels, int sampleRate,
         if (fwrite(data, 1, (size_t)frames * channels * 2, f) != (size_t)frames * channels * 2) ok = 0;
         free(data);
     }
+}
+
+/* run an external command (sox/ffmpeg); returns the command exit code */
+static int runCmd(const char *cmd)
+{
+    return system(cmd);
+}
+
+/* load a WAV file into a double buffer (used for external-tool temp files) */
+static double *loadWav(const char *path, WavInfo *info, long *frames)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    unsigned char *buf = (unsigned char *)malloc((size_t)size);
+    if (!buf) { fclose(f); return NULL; }
+    if (fread(buf, 1, (size_t)size, f) != (size_t)size) {
+        free(buf); fclose(f); return NULL;
+    }
+    fclose(f);
+    if (!parseWav(buf, size, info)) { free(buf); return NULL; }
+    *frames = info->dataSize / (info->bits / 8) / info->channels;
+    double *pcm = (double *)malloc((size_t)(*frames) * info->channels * sizeof(double));
+    if (!pcm) { free(buf); return NULL; }
+    decodePcm(buf, size, info, pcm, *frames);
+    free(buf);
+    return pcm;
+}
     if (fclose(f) != 0) ok = 0;
     if (!ok) remove(path);
     return ok;
@@ -345,6 +391,8 @@ int main(int argc, char **argv)
     int nlogs = 0;
     char *args[4];
     int nargs = 0;
+    char pitchtype[32];
+    snprintf(pitchtype, sizeof(pitchtype), "%s", "default");
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -355,7 +403,18 @@ int main(int argc, char **argv)
             nlogs = 1;
             continue;
         }
+        if (strcmp(argv[i], "--pitchtype") == 0) {
+            if (i + 1 < argc) snprintf(pitchtype, sizeof(pitchtype), "%s", argv[++i]);
+            continue;
+        }
         if (nargs < 4) args[nargs++] = argv[i];
+    }
+
+    if (strcmp(pitchtype, "default") != 0 &&
+        strcmp(pitchtype, "a17") != 0 &&
+        strcmp(pitchtype, "rubberband") != 0) {
+        if (!nlogs) { printf("%s\n\nERROR: Invalid pitchtype.\n", HELP); }
+        return 1;
     }
 
     if (nargs < 4) {
@@ -442,25 +501,62 @@ int main(int argc, char **argv)
     inRms = sqrt(inRms / (double)total);
 
     int ok = 1;
-    for (int i = 0; i < np && ok; i++)
-        ok = addVoice(mix, frames, info.channels, pcm, pitches[i]);
+    int ext = 0;
+    if (strcmp(pitchtype, "default") == 0) {
+        for (int i = 0; i < np && ok; i++)
+            ok = addVoice(mix, frames, info.channels, pcm, pitches[i]);
+    } else {
+        char cmd[4096];
+        char tmp[512];
+        for (int i = 0; i < np && ok; i++) {
+            snprintf(tmp, sizeof(tmp), "chuanmp.%ld.%d.wav", (long)GETPID(), i);
+            if (strcmp(pitchtype, "a17") == 0) {
+                long cents = lround(pitches[i] * 100.0);
+                snprintf(cmd, sizeof(cmd), "sox \"%s\" \"%s\" pitch %ld",
+                         input, tmp, cents);
+            } else {
+                double ratio = pow(2.0, pitches[i] / 12.0);
+                snprintf(cmd, sizeof(cmd),
+                         "ffmpeg -hide_banner -loglevel error -y -i \"%s\" "
+                         "-af \"rubberband=pitch=%.6f:window=long:transients=crisp:"
+                         "smoothing=2.14748e+09/4.9:pitchq=speed:detector=percussive\" \"%s\"",
+                         input, ratio, tmp);
+            }
+            if (runCmd(cmd) != 0) { ext = 1; ok = 0; break; }
+            WavInfo ti;
+            long tf = 0;
+            double *tp = loadWav(tmp, &ti, &tf);
+            remove(tmp);
+            if (!tp) { ext = 1; ok = 0; break; }
+            if (ti.channels != info.channels) { free(tp); ext = 1; ok = 0; break; }
+            long lim = tf < frames ? tf : frames;
+            for (long j = 0; j < lim * info.channels; j++)
+                mix[j] += tp[j];
+            free(tp);
+        }
+    }
     free(pcm);
 
     if (!ok) {
         free(mix);
-        if (!nlogs) { printf("%s\n\nERROR: Out of memory.\n", HELP); }
+        if (!nlogs) {
+            if (ext) printf("%s\n\nERROR: External pitch tool (sox/ffmpeg) failed.\n", HELP);
+            else printf("%s\n\nERROR: Out of memory.\n", HELP);
+        }
         return 1;
     }
 
-    /* volume per pitch = (values / 2) + 0.5: scale the mix so its loudness is
-       (np / 2 + 0.5) x the input (--pitch 7;-5 = volume 1.5, --pitch 7;5;5 = volume 2);
-       a soft limiter catches the louder peaks so it never harshly clips */
+    /* volume per pitch: default = (values / 2) + 0.5, a17/rubberband = values;
+       scale the mix so its loudness is that many x the input; a soft limiter
+       catches the louder peaks so it never harshly clips */
+    double vol = (strcmp(pitchtype, "default") == 0)
+                 ? ((double)np / 2.0 + 0.5) : (double)np;
     double rms = 0.0;
     for (long i = 0; i < total; i++)
         rms += mix[i] * mix[i];
     rms = sqrt(rms / (double)total);
     if (inRms > 0.0 && rms > 0.0) {
-        double g = (inRms * ((double)np / 2.0 + 0.5)) / rms;
+        double g = (inRms * vol) / rms;
         const double T = 0.95; /* soft-limiter threshold */
         for (long i = 0; i < total; i++) {
             double v = mix[i] * g;
