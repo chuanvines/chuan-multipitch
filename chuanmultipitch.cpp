@@ -12,6 +12,11 @@
  *   so "--pitch 7;-5" = 2 voices at volume 1.5, "--pitch 7;5;5" = 3 voices at volume 2.
  *   Peaks are soft-limited so the louder mix never harshly clips.
  *
+ *   Optional --pitchtype <default|a17|rubberband> (default = "default"):
+ *     default    = built-in resample + WSOLA, no external tools, volume = (values / 2) + 0.5
+ *     a17        = sox "pitch" per voice,  volume = values (requires sox)
+ *     rubberband = ffmpeg rubberband filter per voice, volume = values (requires ffmpeg)
+ *
  *   Pitch is shifted WITHOUT changing speed/duration
  *   (windowed-sinc resample + WSOLA time-stretch).
  *
@@ -29,6 +34,12 @@
 #include <vector>
 #include <fstream>
 #include <algorithm>
+
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -49,7 +60,12 @@ static const char *HELP =
     "\n"
     "[4] VALUE (semitones -120..120, decimals ok, example: --pitch 7.5;-2.5)\n"
     "\n"
-    "volume per pitch = (values / 2) + 0.5 (--pitch 7;-5 = volume 1.5, --pitch 7;5;5 = volume 2)\n"
+    "[5] OPTIONAL FLAG (--pitchtype default|a17|rubberband, default = default)\n"
+    "    default    = built-in resample + WSOLA, volume = (values / 2) + 0.5\n"
+    "    a17        = sox pitch per voice,        volume = values (needs sox)\n"
+    "    rubberband = ffmpeg rubberband per voice, volume = values (needs ffmpeg)\n"
+    "\n"
+    "volume per pitch: default = (values / 2) + 0.5, a17/rubberband = values\n"
     "pitch shifts WITHOUT speed change\n"
     "\n"
     "example:\n"
@@ -192,6 +208,27 @@ static bool writeWav(const std::string &path, int channels, int sampleRate,
     return (bool)f;
 }
 
+/* run an external command (sox/ffmpeg); returns the command exit code */
+static int runCmd(const std::string &cmd)
+{
+    return system(cmd.c_str());
+}
+
+/* load a WAV file into a double buffer (used for external-tool temp files) */
+static bool loadWav(const std::string &path, WavInfo &info,
+                    std::vector<double> &pcm, long &frames)
+{
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    std::vector<uint8_t> buf((std::istreambuf_iterator<char>(f)),
+                             std::istreambuf_iterator<char>());
+    f.close();
+    if (!parseWav(buf, info)) return false;
+    frames = info.dataSize / (info.bits / 8) / info.channels;
+    pcm = decodePcm(buf, info, frames);
+    return true;
+}
+
 /* ------------------------------------------------------------------ */
 /* DSP: windowed-sinc resampler                                        */
 /* ------------------------------------------------------------------ */
@@ -324,6 +361,7 @@ int main(int argc, char **argv)
     bool nlogs = false;
     std::string args[4];
     int nargs = 0;
+    std::string pitchtype = "default";
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -335,7 +373,16 @@ int main(int argc, char **argv)
             nlogs = true;
             continue;
         }
+        if (a == "--pitchtype") {
+            if (i + 1 < argc) pitchtype = argv[++i];
+            continue;
+        }
         if (nargs < 4) args[nargs++] = a;
+    }
+
+    if (pitchtype != "default" && pitchtype != "a17" && pitchtype != "rubberband") {
+        if (!nlogs) printf("%s\n\nERROR: Invalid pitchtype.\n", HELP);
+        return 1;
     }
 
     if (nargs < 4) {
@@ -405,21 +452,61 @@ int main(int argc, char **argv)
     for (double v : pcm) inRms += v * v;
     inRms = std::sqrt(inRms / (double)total);
 
-    for (double p : pitches) {
-        if (!addVoice(mix, frames, info.channels, pcm, p)) {
-            if (!nlogs) printf("%s\n\nERROR: Out of memory.\n", HELP);
-            return 1;
+    int ok = 1;
+    int ext = 0;
+    if (pitchtype == "default") {
+        for (double p : pitches) {
+            if (!addVoice(mix, frames, info.channels, pcm, p)) {
+                ok = 0;
+                break;
+            }
+        }
+    } else {
+        for (int i = 0; i < (int)pitches.size() && ok; i++) {
+            std::string tmp = "chuanmp." + std::to_string(GETPID()) + "." +
+                              std::to_string(i) + ".wav";
+            std::string cmd;
+            if (pitchtype == "a17") {
+                long cents = std::lround(pitches[i] * 100.0);
+                cmd = "sox \"" + input + "\" \"" + tmp + "\" pitch " +
+                      std::to_string(cents);
+            } else {
+                double ratio = std::pow(2.0, pitches[i] / 12.0);
+                cmd = "ffmpeg -hide_banner -loglevel error -y -i \"" + input +
+                      "\" -af \"rubberband=pitch=" + std::to_string(ratio) +
+                      ":window=long:transients=crisp:smoothing=2.14748e+09/4.9:"
+                      "pitchq=speed:detector=percussive\" \"" + tmp + "\"";
+            }
+            if (runCmd(cmd) != 0) { ext = 1; ok = 0; break; }
+            WavInfo ti;
+            std::vector<double> tp;
+            long tf = 0;
+            if (!loadWav(tmp, ti, tp, tf)) { remove(tmp.c_str()); ext = 1; ok = 0; break; }
+            remove(tmp.c_str());
+            if (ti.channels != info.channels) { ext = 1; ok = 0; break; }
+            long lim = tf < frames ? tf : frames;
+            for (long j = 0; j < lim * info.channels; j++)
+                mix[(size_t)j] += tp[(size_t)j];
         }
     }
+    if (!ok) {
+        if (!nlogs) {
+            if (ext) printf("%s\n\nERROR: External pitch tool (sox/ffmpeg) failed.\n", HELP);
+            else printf("%s\n\nERROR: Out of memory.\n", HELP);
+        }
+        return 1;
+    }
 
-    /* volume per pitch = (values / 2) + 0.5: scale the mix so its loudness is
-       (n / 2 + 0.5) x the input (--pitch 7;-5 = volume 1.5, --pitch 7;5;5 = volume 2);
-       a soft limiter catches the louder peaks so it never harshly clips */
+    /* volume per pitch: default = (values / 2) + 0.5, a17/rubberband = values;
+       scale the mix so its loudness is that many x the input; a soft limiter
+       catches the louder peaks so it never harshly clips */
+    double vol = (pitchtype == "default")
+                 ? ((double)pitches.size() / 2.0 + 0.5) : (double)pitches.size();
     double rms = 0.0;
     for (double v : mix) rms += v * v;
     rms = std::sqrt(rms / (double)total);
     if (inRms > 0.0 && rms > 0.0) {
-        double g = (inRms * ((double)pitches.size() / 2.0 + 0.5)) / rms;
+        double g = (inRms * vol) / rms;
         const double T = 0.95; /* soft-limiter threshold */
         for (double &x : mix) {
             double v = x * g;
