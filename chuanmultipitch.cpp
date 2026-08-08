@@ -468,8 +468,8 @@ int main(int argc, char **argv)
             std::string cmd;
             if (pitchtype == "a17") {
                 long cents = std::lround(pitches[i] * 100.0);
-                cmd = "sox \"" + input + "\" \"" + tmp + "\" pitch " +
-                      std::to_string(cents);
+                cmd = "sox -q \"" + input + "\" \"" + tmp + "\" pitch " +
+                      std::to_string(cents) + " 10 10 10";
             } else {
                 double ratio = std::pow(2.0, pitches[i] / 12.0);
                 cmd = "ffmpeg -hide_banner -loglevel error -y -i \"" + input +
