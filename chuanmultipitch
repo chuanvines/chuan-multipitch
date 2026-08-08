@@ -548,7 +548,7 @@ int main(int argc, char **argv)
             snprintf(tmp, sizeof(tmp), "chuanmp.%ld.%d.wav", (long)GETPID(), i);
             if (strcmp(pitchtype, "a17") == 0) {
                 long cents = lround(pitches[i] * 100.0);
-                snprintf(cmd, sizeof(cmd), "sox \"%s\" \"%s\" pitch %ld",
+                snprintf(cmd, sizeof(cmd), "sox -q \"%s\" \"%s\" pitch %ld 10 10 10",
                          input, tmp, cents);
             } else {
                 double ratio = pow(2.0, pitches[i] / 12.0);
