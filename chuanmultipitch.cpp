@@ -71,9 +71,8 @@ static const char *HELP =
     "    a17        = sox pitch per voice,        volume = values (needs sox)\n"
     "    rubberband = ffmpeg rubberband per voice, volume = values (needs ffmpeg)\n"
     "\n"
-    "[6] OPTIONAL FLAG (--type default|audiobuggy|reverse|oppositepitch, default = default)\n"
+    "[6] OPTIONAL FLAG (--type default|reverse|oppositepitch, default = default)\n"
     "    default       = plain pitch shift\n"
-    "    audiobuggy    = swap halves: [2nd half][1st half]\n"
     "    reverse       = play the audio backwards\n"
     "    oppositepitch = flip pitch signs, --pitch -7;6 -> 7;-6\n"
     "\n"
@@ -255,25 +254,6 @@ static void reversePcm(std::vector<double> &pcm, long frames, int channels)
     }
 }
 
-/* audiobuggy: {1} = trim start by half duration (keep 2nd half),
-   {2} = trim end by half duration (keep 1st half), concat {1,2} */
-static std::vector<double> audiobuggyPcm(const std::vector<double> &pcm,
-                                         long frames, int channels, long *outFrames)
-{
-    long half = frames / 2;
-    if (half < 1) half = 1;
-    long on = half * 2;
-    std::vector<double> out((size_t)on * channels);
-    for (long f = 0; f < half; f++) {
-        for (int c = 0; c < channels; c++) {
-            out[(size_t)f * channels + c]            = pcm[(size_t)(f + half) * channels + c];
-            out[(size_t)(f + half) * channels + c]   = pcm[(size_t)f * channels + c];
-        }
-    }
-    *outFrames = on;
-    return out;
-}
-
 /* ------------------------------------------------------------------ */
 /* DSP: windowed-sinc resampler                                        */
 /* ------------------------------------------------------------------ */
@@ -435,8 +415,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if (type != "default" && type != "audiobuggy" &&
-        type != "reverse" && type != "oppositepitch") {
+    if (type != "default" && type != "reverse" && type != "oppositepitch") {
         if (!nlogs) printf("%s\n\nERROR: Invalid type.\n", HELP);
         return 1;
     }
@@ -510,12 +489,6 @@ int main(int argc, char **argv)
 
     if (type == "reverse") {
         reversePcm(pcm, frames, info.channels);
-    } else if (type == "audiobuggy") {
-        long nf = 0;
-        pcm = audiobuggyPcm(pcm, frames, info.channels, &nf);
-        frames = nf;
-        total = frames * info.channels;
-        mix.assign((size_t)total, 0.0);
     }
 
     double inRms = 0.0;
