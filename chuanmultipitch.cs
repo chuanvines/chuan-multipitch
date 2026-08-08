@@ -27,9 +27,8 @@ class ChuanMultiPitch
         "    a17        = sox pitch per voice,        volume = values (needs sox)\n" +
         "    rubberband = ffmpeg rubberband per voice, volume = values (needs ffmpeg)\n" +
         "\n" +
-        "[6] OPTIONAL FLAG (--type default|audiobuggy|reverse|oppositepitch, default = default)\n" +
+        "[6] OPTIONAL FLAG (--type default|reverse|oppositepitch, default = default)\n" +
         "    default       = plain pitch shift\n" +
-        "    audiobuggy    = swap halves: [2nd half][1st half]\n" +
         "    reverse       = play the audio backwards\n" +
         "    oppositepitch = flip pitch signs, --pitch -7;6 -> 7;-6\n" +
         "\n" +
@@ -81,8 +80,7 @@ class ChuanMultiPitch
             return 1;
         }
 
-        if (type != "default" && type != "audiobuggy" &&
-            type != "reverse" && type != "oppositepitch")
+        if (type != "default" && type != "reverse" && type != "oppositepitch")
         {
             Fail(nlogs, "ERROR: Invalid type.");
             return 1;
@@ -156,14 +154,6 @@ class ChuanMultiPitch
         if (type == "reverse")
         {
             ReversePcm(pcm, frames, info.Channels);
-        }
-        else if (type == "audiobuggy")
-        {
-            long nf;
-            pcm = AudioBuggyPcm(pcm, frames, info.Channels, out nf);
-            frames = nf;
-            total = frames * info.Channels;
-            mix = new double[total];
         }
 
         double inRms = 0.0;
@@ -320,26 +310,6 @@ class ChuanMultiPitch
                 pcm[b + c] = t;
             }
         }
-    }
-
-    // audiobuggy: {1} = trim start by half duration (keep 2nd half),
-    // {2} = trim end by half duration (keep 1st half), concat {1,2}
-    static double[] AudioBuggyPcm(double[] pcm, long frames, int channels, out long outFrames)
-    {
-        long half = frames / 2;
-        if (half < 1) half = 1;
-        long on = half * 2;
-        double[] outp = new double[on * channels];
-        for (long f = 0; f < half; f++)
-        {
-            for (int c = 0; c < channels; c++)
-            {
-                outp[f * channels + c] = pcm[(f + half) * channels + c];
-                outp[(f + half) * channels + c] = pcm[f * channels + c];
-            }
-        }
-        outFrames = on;
-        return outp;
     }
 
     // ------------------------------------------------------------------
